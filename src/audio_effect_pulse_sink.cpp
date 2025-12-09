@@ -3,6 +3,7 @@
 #include "audio_effect_pulse_sink.h"
 
 #include <godot_cpp/classes/audio_server.hpp>
+#include <godot_cpp/classes/audio_frame.hpp>
 #include <godot_cpp/core/class_db.hpp>
 #include <godot_cpp/variant/utility_functions.hpp>
 
@@ -267,7 +268,8 @@ void AudioEffectPulseSinkInstance::_process(const void *p_src_buffer,
 	// Bus output:
 	if (mute) {
 		for (int32_t i = 0; i < p_frame_count; i++) {
-			p_dst_buffer[i] = AudioFrame(0.0f, 0.0f);
+			p_dst_buffer[i].left = 0.0f;
+			p_dst_buffer[i].right = 0.0f;
 		}
 	} else {
 		for (int32_t i = 0; i < p_frame_count; i++) {

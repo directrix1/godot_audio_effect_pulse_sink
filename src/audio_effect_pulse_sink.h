@@ -37,7 +37,7 @@ public:
 	void set_mute_bus(bool p_mute);
 	bool get_mute_bus() const;
 
-	Ref<AudioEffectInstance> _instantiate() const override;
+	Ref<AudioEffectInstance> _instantiate() const;
 };
 
 class AudioEffectPulseSinkInstance : public AudioEffectInstance {
