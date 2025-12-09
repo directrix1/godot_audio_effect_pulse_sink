@@ -3,7 +3,6 @@
 #include "audio_effect_pulse_sink.h"
 
 #include <godot_cpp/classes/audio_server.hpp>
-#include <godot_cpp/classes/audio_frame.hpp>
 #include <godot_cpp/core/class_db.hpp>
 #include <godot_cpp/variant/utility_functions.hpp>
 
@@ -77,35 +76,40 @@ void AudioEffectPulseSinkInstance::set_base(const Ref<AudioEffectPulseSink> &p_b
 	cached_sink_name = String(); // force re-open on first process
 }
 
-// =================== Ring buffer helpers ===================
+// =================== Ring buffer helpers (frames) ===================
 
 void AudioEffectPulseSinkInstance::_ensure_ring() {
-	if (ring_data.size() != RING_CAPACITY) {
-		ring_data.resize(RING_CAPACITY);
+	if (ring_data.size() != RING_CAPACITY_FRAMES) {
+		ring_data.resize(RING_CAPACITY_FRAMES);
 	}
-	if (worker_buffer.size() != RING_CAPACITY) {
-		worker_buffer.resize(RING_CAPACITY);
+	if (worker_frame_buffer.size() != RING_CAPACITY_FRAMES) {
+		worker_frame_buffer.resize(RING_CAPACITY_FRAMES);
 	}
+	if (worker_interleaved_buf.size() != RING_CAPACITY_FRAMES * 2) {
+		worker_interleaved_buf.resize(RING_CAPACITY_FRAMES * 2);
+	}
+
 	ring_head.store(0, std::memory_order_relaxed);
 	ring_tail.store(0, std::memory_order_relaxed);
 }
 
-void AudioEffectPulseSinkInstance::_ring_push_sample(float s) {
+void AudioEffectPulseSinkInstance::_ring_push_frame(const AudioFrame &p_frame) {
 	// Single producer: audio thread only.
 	size_t head = ring_head.load(std::memory_order_relaxed);
 	size_t tail = ring_tail.load(std::memory_order_acquire);
 
-	size_t next_head = (head + 1) & (RING_CAPACITY - 1);
+	size_t next_head = (head + 1) & (RING_CAPACITY_FRAMES - 1);
+
 	if (next_head == tail) {
-		// Buffer full, drop sample (avoid blocking audio thread).
+		// Buffer full: drop frame to avoid blocking audio thread.
 		return;
 	}
 
-	ring_data[head] = s;
+	ring_data[head] = p_frame;
 	ring_head.store(next_head, std::memory_order_release);
 }
 
-size_t AudioEffectPulseSinkInstance::_ring_pop_many(float *p_dst, size_t p_max_samples) {
+size_t AudioEffectPulseSinkInstance::_ring_pop_many(AudioFrame *p_dst, size_t p_max_frames) {
 	// Single consumer: worker thread only.
 	size_t head = ring_head.load(std::memory_order_acquire);
 	size_t tail = ring_tail.load(std::memory_order_relaxed);
@@ -114,14 +118,27 @@ size_t AudioEffectPulseSinkInstance::_ring_pop_many(float *p_dst, size_t p_max_s
 		return 0; // empty
 	}
 
+	size_t available;
+	if (head >= tail) {
+		available = head - tail;
+	} else {
+		available = (RING_CAPACITY_FRAMES - tail) + head;
+	}
+
+	if (available == 0) {
+		return 0;
+	}
+
+	size_t to_read = (available > p_max_frames) ? p_max_frames : available;
+
 	size_t count = 0;
-	while (tail != head && count < p_max_samples) {
+	while (count < to_read) {
 		p_dst[count++] = ring_data[tail];
-		tail = (tail + 1) & (RING_CAPACITY - 1);
+		tail = (tail + 1) & (RING_CAPACITY_FRAMES - 1);
 	}
 
 	ring_tail.store(tail, std::memory_order_release);
-	return count;
+	return to_read;
 }
 
 // =================== Worker thread ===================
@@ -130,29 +147,40 @@ void AudioEffectPulseSinkInstance::_worker_loop() {
 	using namespace std::chrono_literals;
 
 	while (thread_running.load(std::memory_order_acquire)) {
-		// Read as many samples as we currently have, up to worker_buffer size.
-		size_t available = _ring_pop_many(worker_buffer.data(), worker_buffer.size());
+		size_t frames = _ring_pop_many(worker_frame_buffer.data(), worker_frame_buffer.size());
 
-		if (available == 0) {
+		if (frames == 0) {
 			std::this_thread::sleep_for(1ms);
 			continue;
 		}
 
-		// pa is only created / destroyed with the worker stopped, so safe to read here.
 		if (!pa) {
 			// No active stream; drop data.
 			continue;
 		}
 
-		const size_t bytes = available * sizeof(float);
-		if (pa_simple_write(pa, worker_buffer.data(), bytes, &pa_error) < 0) {
-			// Can't use Godot logging from non-main threads safely; just stop on error.
+		// Interleave frames into float buffer [L, R, L, R, ...].
+		const size_t sample_count = frames * 2;
+		if (worker_interleaved_buf.size() < sample_count) {
+			worker_interleaved_buf.resize(sample_count);
+		}
+
+		for (size_t i = 0; i < frames; ++i) {
+			const AudioFrame &f = worker_frame_buffer[i];
+			worker_interleaved_buf[(i * 2) + 0] = f.left;
+			worker_interleaved_buf[(i * 2) + 1] = f.right;
+		}
+
+		const size_t bytes = sample_count * sizeof(float);
+
+		if (pa_simple_write(pa, worker_interleaved_buf.data(), bytes, &pa_error) < 0) {
+			// Can't safely call Godot logging from non-main thread; just stop.
 			thread_running.store(false, std::memory_order_release);
 			break;
 		}
 	}
 
-	// Optional: final drain on exit (done in audio thread when closing stream).
+	// Drain happens when we close the stream on the main/audio thread.
 }
 
 // =================== PulseAudio stream lifecycle ===================
@@ -166,7 +194,6 @@ void AudioEffectPulseSinkInstance::_stop_thread() {
 }
 
 void AudioEffectPulseSinkInstance::_start_thread() {
-	// Only start if not already running.
 	if (thread_running.load(std::memory_order_acquire)) {
 		return;
 	}
@@ -176,7 +203,7 @@ void AudioEffectPulseSinkInstance::_start_thread() {
 
 void AudioEffectPulseSinkInstance::_close_stream() {
 	if (pa) {
-		// We're on the audio/main thread here; worker is already stopped.
+		// Worker is stopped before we call this.
 		pa_simple_drain(pa, &pa_error);
 		pa_simple_free(pa);
 		pa = nullptr;
@@ -242,7 +269,7 @@ void AudioEffectPulseSinkInstance::_ensure_stream() {
 
 	UtilityFunctions::print("AudioEffectPulseSink: Connected to PulseAudio sink: ", current_sink);
 
-	// Reset ring buffer to avoid sending stale samples to a new sink.
+	// Reset ring buffer to avoid sending stale frames to a new sink.
 	_ensure_ring();
 
 	// Start worker thread that drains ring buffer into pa_simple_write().
@@ -260,7 +287,7 @@ void AudioEffectPulseSinkInstance::_process(const void *p_src_buffer,
 
 	const AudioFrame *src = static_cast<const AudioFrame *>(p_src_buffer);
 
-	// First, ensure PA stream is ready (or re-created if sink changed).
+	// Ensure PA stream is ready (or re-created if sink changed).
 	_ensure_stream();
 
 	bool mute = base.is_valid() ? base->get_mute_bus() : false;
@@ -277,10 +304,8 @@ void AudioEffectPulseSinkInstance::_process(const void *p_src_buffer,
 		}
 	}
 
-	// Mirror into ring buffer as interleaved float32 [L, R, L, R, ...].
-	// This is non-blocking; overflow will just drop samples.
+	// Mirror into ring buffer (whole frames).
 	for (int32_t i = 0; i < p_frame_count; i++) {
-		_ring_push_sample(src[i].left);
-		_ring_push_sample(src[i].right);
+		_ring_push_frame(src[i]);
 	}
 }

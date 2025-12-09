@@ -5,6 +5,7 @@
 #include <godot_cpp/classes/audio_effect.hpp>
 #include <godot_cpp/classes/audio_effect_instance.hpp>
 #include <godot_cpp/classes/audio_server.hpp>
+#include <godot_cpp/classes/audio_frame.hpp>
 #include <godot_cpp/core/class_db.hpp>
 #include <godot_cpp/variant/utility_functions.hpp>
 
@@ -54,23 +55,26 @@ class AudioEffectPulseSinkInstance : public AudioEffectInstance {
 	// Audio config
 	float mix_rate = 48000.0f;
 
-	// ================= Ring buffer =================
-	// Single-producer (audio thread), single-consumer (worker thread) lock-free ring.
-	static constexpr size_t RING_CAPACITY_POW2 = 16;           // 2^16 = 65536 samples
-	static constexpr size_t RING_CAPACITY = (1u << RING_CAPACITY_POW2);
-	std::vector<float> ring_data;
-	std::atomic<size_t> ring_head { 0 }; // write index
-	std::atomic<size_t> ring_tail { 0 }; // read index
+	// ================= Ring buffer (in frames) =================
+	// Single-producer (audio thread), single-consumer (worker thread).
+	static constexpr size_t RING_CAPACITY_FRAMES_POW2 = 12; // 2^12 = 4096 frames
+	static constexpr size_t RING_CAPACITY_FRAMES = (1u << RING_CAPACITY_FRAMES_POW2);
 
-	std::vector<float> worker_buffer; // temp buffer used by worker thread for contiguous writes
+	std::vector<AudioFrame> ring_data; // ring buffer of frames
+	std::atomic<size_t> ring_head { 0 }; // write index (frame)
+	std::atomic<size_t> ring_tail { 0 }; // read index (frame)
+
+	// Worker buffers
+	std::vector<AudioFrame> worker_frame_buffer;     // popped frames
+	std::vector<float>      worker_interleaved_buf;  // interleaved L/R floats for PA
 
 	// Worker thread
 	std::thread worker_thread;
 	std::atomic<bool> thread_running { false };
 
 	void _ensure_ring();
-	void _ring_push_sample(float s);
-	size_t _ring_pop_many(float *p_dst, size_t p_max_samples);
+	void _ring_push_frame(const AudioFrame &p_frame);
+	size_t _ring_pop_many(AudioFrame *p_dst, size_t p_max_frames);
 
 	void _worker_loop();
 
