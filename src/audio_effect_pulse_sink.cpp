@@ -150,7 +150,11 @@ void AudioEffectPulseSinkInstance::_ring_push_frames(const AudioFrame *p_src, si
 }
 
 size_t AudioEffectPulseSinkInstance::_ring_pop_many(AudioFrame *p_dst, size_t p_max_frames) {
-	// Single consumer: worker thread only.
+	if (!p_dst || p_max_frames == 0) {
+		return 0;
+	}
+
+	// Single consumer thread.
 	size_t head = ring_head.load(std::memory_order_acquire);
 	size_t tail = ring_tail.load(std::memory_order_relaxed);
 
@@ -158,12 +162,12 @@ size_t AudioEffectPulseSinkInstance::_ring_pop_many(AudioFrame *p_dst, size_t p_
 		return 0; // empty
 	}
 
-	size_t available;
-	if (head >= tail) {
-		available = head - tail;
-	} else {
-		available = (RING_CAPACITY_FRAMES - tail) + head;
-	}
+	const size_t capacity = RING_CAPACITY_FRAMES;
+
+	// Calculate how many frames are available.
+	size_t available = (head >= tail)
+		? (head - tail)
+		: (capacity - tail + head);
 
 	if (available == 0) {
 		return 0;
@@ -171,56 +175,71 @@ size_t AudioEffectPulseSinkInstance::_ring_pop_many(AudioFrame *p_dst, size_t p_
 
 	size_t to_read = (available > p_max_frames) ? p_max_frames : available;
 
-	size_t count = 0;
-	while (count < to_read) {
-		p_dst[count++] = ring_data[tail];
-		tail = (tail + 1) & (RING_CAPACITY_FRAMES - 1);
+	// First contiguous segment until end of ring.
+	size_t first_chunk = to_read;
+	size_t space_till_end = capacity - tail;
+	if (first_chunk > space_till_end) {
+		first_chunk = space_till_end;
 	}
 
-	ring_tail.store(tail, std::memory_order_release);
+	// Copy the first contiguous block.
+	std::memcpy(p_dst,
+	            &ring_data[tail],
+	            first_chunk * sizeof(AudioFrame));
+
+	// Copy the second block (wrapped) if needed.
+	size_t remaining = to_read - first_chunk;
+	if (remaining > 0) {
+		std::memcpy(p_dst + first_chunk,
+		            &ring_data[0],
+		            remaining * sizeof(AudioFrame));
+	}
+
+	// Publish new consumer index.
+	ring_tail.store((tail + to_read) & (capacity - 1), std::memory_order_release);
+
 	return to_read;
 }
 
 // =================== Worker thread ===================
 
 void AudioEffectPulseSinkInstance::_worker_loop() {
-	using namespace std::chrono_literals;
+    using namespace std::chrono_literals;
 
-	while (thread_running.load(std::memory_order_acquire)) {
-		size_t frames = _ring_pop_many(worker_frame_buffer.data(), worker_frame_buffer.size());
+    // Ensure AudioFrame is exactly two floats stored contiguously.
+    static_assert(sizeof(AudioFrame) == sizeof(float) * 2,
+        "AudioFrame must be exactly two floats for direct streaming.");
 
-		if (frames == 0) {
-			std::this_thread::sleep_for(1ms);
-			continue;
-		}
+    while (thread_running.load(std::memory_order_acquire)) {
+        // Pop as many frames as available into worker_frame_buffer.
+        size_t frames = _ring_pop_many(worker_frame_buffer.data(),
+                                       worker_frame_buffer.size());
 
-		if (!pa) {
-			// No active stream; drop data.
-			continue;
-		}
+        if (frames == 0) {
+            std::this_thread::sleep_for(1ms);
+            continue;
+        }
 
-		// Interleave frames into float buffer [L, R, L, R, ...].
-		const size_t sample_count = frames * 2;
-		if (worker_interleaved_buf.size() < sample_count) {
-			worker_interleaved_buf.resize(sample_count);
-		}
+        if (!pa) {
+            // Stream not ready—drop the frames.
+            continue;
+        }
 
-		for (size_t i = 0; i < frames; ++i) {
-			const AudioFrame &f = worker_frame_buffer[i];
-			worker_interleaved_buf[(i * 2) + 0] = f.left;
-			worker_interleaved_buf[(i * 2) + 1] = f.right;
-		}
+        // AudioFrame* → float* (interleaved L,R,L,R,...)
+        const float *samples = reinterpret_cast<const float *>(worker_frame_buffer.data());
 
-		const size_t bytes = sample_count * sizeof(float);
+        // Number of bytes to send to PulseAudio.
+        const size_t bytes = frames * sizeof(AudioFrame);
 
-		if (pa_simple_write(pa, worker_interleaved_buf.data(), bytes, &pa_error) < 0) {
-			// Can't safely call Godot logging from non-main thread; just stop.
-			thread_running.store(false, std::memory_order_release);
-			break;
-		}
-	}
+        // Write directly from worker_frame_buffer.
+        if (pa_simple_write(pa, samples, bytes, &pa_error) < 0) {
+            // Can't call Godot logging here; just stop.
+            thread_running.store(false, std::memory_order_release);
+            break;
+        }
+    }
 
-	// Drain happens when we close the stream on the main/audio thread.
+    // Drain handled by main thread when closing PA stream.
 }
 
 // =================== PulseAudio stream lifecycle ===================
@@ -330,20 +349,16 @@ void AudioEffectPulseSinkInstance::_process(const void *p_src_buffer,
 	// Ensure PA stream is ready (or re-created if sink changed).
 	_ensure_stream();
 
-	bool mute = base.is_valid() ? base->get_mute_bus() : false;
+	const bool mute = base.is_valid() ? base->get_mute_bus() : false;
+	const size_t byte_count = static_cast<size_t>(p_frame_count) * sizeof(AudioFrame);
 
-	// Bus output:
+	// Bus output: fast path with memset/memcpy.
 	if (mute) {
-		for (int32_t i = 0; i < p_frame_count; i++) {
-			p_dst_buffer[i].left = 0.0f;
-			p_dst_buffer[i].right = 0.0f;
-		}
+		std::memset(p_dst_buffer, 0, byte_count);
 	} else {
-		for (int32_t i = 0; i < p_frame_count; i++) {
-			p_dst_buffer[i] = src[i]; // pass-through
-		}
+		std::memcpy(p_dst_buffer, src, byte_count);
 	}
 
-	// Mirror into ring buffer (bulk push)
+	// Mirror into ring buffer (bulk push of frames).
 	_ring_push_frames(src, static_cast<size_t>(p_frame_count));
 }
