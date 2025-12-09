@@ -93,20 +93,60 @@ void AudioEffectPulseSinkInstance::_ensure_ring() {
 	ring_tail.store(0, std::memory_order_relaxed);
 }
 
-void AudioEffectPulseSinkInstance::_ring_push_frame(const AudioFrame &p_frame) {
+void AudioEffectPulseSinkInstance::_ring_push_frames(const AudioFrame *p_src, size_t p_frame_count) {
+	if (p_frame_count == 0) {
+		return;
+	}
+
+	const size_t capacity = RING_CAPACITY_FRAMES;
+
 	// Single producer: audio thread only.
 	size_t head = ring_head.load(std::memory_order_relaxed);
 	size_t tail = ring_tail.load(std::memory_order_acquire);
 
-	size_t next_head = (head + 1) & (RING_CAPACITY_FRAMES - 1);
+	// Compute free space in ring (one slot kept empty to distinguish full vs empty).
+	size_t used;
+	if (head >= tail) {
+		used = head - tail;
+	} else {
+		used = (capacity - tail) + head;
+	}
+	size_t free = capacity - used - 1;
 
-	if (next_head == tail) {
-		// Buffer full: drop frame to avoid blocking audio thread.
+	if (free == 0) {
+		// No space at all, drop whole block.
 		return;
 	}
 
-	ring_data[head] = p_frame;
-	ring_head.store(next_head, std::memory_order_release);
+	// We can only push up to `free` frames.
+	size_t to_write = (p_frame_count > free) ? free : p_frame_count;
+	if (to_write == 0) {
+		return;
+	}
+
+	// First contiguous segment before wrap.
+	size_t first_chunk = to_write;
+	size_t space_till_end = capacity - head;
+	if (first_chunk > space_till_end) {
+		first_chunk = space_till_end;
+	}
+
+	// Copy first chunk.
+	std::memcpy(&ring_data[head],
+	            p_src,
+	            first_chunk * sizeof(AudioFrame));
+
+	// Copy second chunk if we wrapped around.
+	size_t remaining = to_write - first_chunk;
+	if (remaining > 0) {
+		std::memcpy(&ring_data[0],
+		            p_src + first_chunk,
+		            remaining * sizeof(AudioFrame));
+	}
+
+	// Publish new head once.
+	size_t new_head = (head + to_write) & (capacity - 1);
+	ring_head.store(new_head, std::memory_order_release);
 }
 
 size_t AudioEffectPulseSinkInstance::_ring_pop_many(AudioFrame *p_dst, size_t p_max_frames) {
@@ -304,8 +344,6 @@ void AudioEffectPulseSinkInstance::_process(const void *p_src_buffer,
 		}
 	}
 
-	// Mirror into ring buffer (whole frames).
-	for (int32_t i = 0; i < p_frame_count; i++) {
-		_ring_push_frame(src[i]);
-	}
+	// Mirror into ring buffer (bulk push)
+	_ring_push_frames(src, static_cast<size_t>(p_frame_count));
 }

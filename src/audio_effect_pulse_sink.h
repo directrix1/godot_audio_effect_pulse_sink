@@ -73,7 +73,7 @@ class AudioEffectPulseSinkInstance : public AudioEffectInstance {
 	std::atomic<bool> thread_running { false };
 
 	void _ensure_ring();
-	void _ring_push_frame(const AudioFrame &p_frame);
+	void _ring_push_frames(const AudioFrame *p_src, size_t p_frame_count);
 	size_t _ring_pop_many(AudioFrame *p_dst, size_t p_max_frames);
 
 	void _worker_loop();
